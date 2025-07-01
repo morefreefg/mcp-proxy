@@ -147,11 +147,7 @@ const proxy = async () => {
         capabilities: serverCapabilities,
       });
 
-      proxyServer({
-        client,
-        server,
-        serverCapabilities,
-      });
+      proxyServer({ client, server, serverCapabilities });
 
       return server;
     } else {

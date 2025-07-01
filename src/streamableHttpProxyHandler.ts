@@ -73,29 +73,35 @@ export const handleStreamableHttpProxy = async (
       )}`
     );
 
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return true;
+    }
+
     /* ========== 1. 处理 initialize ========= */
+    // 在initialize请求处理部分，修改Server连接逻辑
     if (isInitializeRequest(body)) {
       const initParams = (body as any).params ?? {};
       let newSessionId = sessionIdHeader ?? randomUUID();
-
+      const globalSessionId = "global-mcp-session";
+    
       /* 检查是否已存在连接，避免重复初始化 */
       if (activeProxyConnections[newSessionId]) {
         console.log(`[streamable-proxy] Session ${newSessionId} already exists, reusing connection`);
         await activeProxyConnections[newSessionId].serverTransport.handleRequest(req, res, body);
         return true;
       }
-
+    
       /* 检查是否有全局连接可以复用（针对单例服务器） */
-      const globalSessionId = "global-mcp-session";
       if (activeProxyConnections[globalSessionId]) {
         console.log(`[streamable-proxy] Using existing global connection for new session ${newSessionId}`);
-        /* 为新session创建一个指向全局连接的引用 */
         activeProxyConnections[newSessionId] = activeProxyConnections[globalSessionId];
         await activeProxyConnections[newSessionId].serverTransport.handleRequest(req, res, body);
         return true;
       }
-
-      /* 先连上游 Server，转发 initialize 拿能力 */
+    
+      /* 尝试连接上游服务器 */
       const clientTransport = new StreamableHTTPClientTransport(target);
       const client = new Client(
         {
@@ -110,7 +116,7 @@ export const handleStreamableHttpProxy = async (
       
       let serverCapabilities: any = {};
       let isGlobalConnection = false;
-      
+    
       try {
         const response = await client.request(
           {
@@ -121,40 +127,54 @@ export const handleStreamableHttpProxy = async (
         );
         serverCapabilities = response.capabilities;
       } catch (error: any) {
-        /* 如果服务器已经初始化，说明这是一个单例服务器，创建全局连接 */
         if (error.message && error.message.includes("Server already initialized")) {
           console.log(`[streamable-proxy] Target server already initialized, creating global connection`);
-          
-          /* 使用默认能力，这个连接将作为全局连接 */
+          isGlobalConnection = true;
+          newSessionId = globalSessionId;
           serverCapabilities = {
             tools: {},
             resources: {},
             prompts: {},
             logging: {}
           };
-          
-          isGlobalConnection = true;
-          newSessionId = globalSessionId;
         } else {
+          await client.close();
           throw error;
         }
       }
+    
 
-      /* 用真实 capabilities 启本地 Server */
-      const server = new Server(
-        { name: "mcp-proxy-server", version: "1.0.0" },
-        { capabilities: serverCapabilities }
-      );
-
-      /* 搭桥：把所有请求在 server ↔ client 间转发 */
-      await proxyServer({ server, client, serverCapabilities });
-
+    
       /* IDE ↔ proxy 的 serverTransport */
       const serverTransport = new StreamableHTTPServerTransport({
         eventStore: new InMemoryEventStore(),
         sessionIdGenerator: () => newSessionId,
+        onsessioninitialized: (sessionId) => {
+          console.log(`Session initialized with ID: ${sessionId}`);
+        },
       });
-
+    
+      /* 用真实 capabilities 创建本地 Server */
+      const server = new Server(
+        { name: "mcp-proxy-server", version: "1.0.0" },
+        { capabilities: serverCapabilities }
+      );
+    
+      /* 关键：先连接server到transport，再设置代理 */
+      await server.connect(serverTransport);
+    
+      /* 搭桥：把所有请求在 server ↔ client 间转发 */
+      proxyServer({ client, server, serverCapabilities });
+    
+      /* 设置transport关闭处理 */
+      serverTransport.onclose = () => {
+        const sid = serverTransport.sessionId;
+        if (sid && activeProxyConnections[sid]) {
+          console.log(`Transport closed for session ${sid}, removing from transports map`);
+          delete activeProxyConnections[sid];
+        }
+      };
+    
       /* 保存连接，以便后续复用 */
       const connection = {
         client,
@@ -169,10 +189,10 @@ export const handleStreamableHttpProxy = async (
       if (isGlobalConnection && sessionIdHeader && sessionIdHeader !== globalSessionId) {
         activeProxyConnections[sessionIdHeader] = connection;
       }
-
+    
       /* 让 serverTransport 处理这次 initialize 请求 */
       await serverTransport.handleRequest(req, res, body);
-
+    
       console.log(
         `[streamable-proxy] Session ${newSessionId} initialized${isGlobalConnection ? ' (global)' : ''}, capabilities keys: ${Object.keys(
           serverCapabilities || {}

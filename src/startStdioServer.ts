@@ -72,11 +72,7 @@ export const startStdioServer = async ({
 
   await stdioServer.connect(stdioTransport);
 
-  await proxyServer({
-    client: streamClient,
-    server: stdioServer,
-    serverCapabilities,
-  });
+  await proxyServer({ client: streamClient, server: stdioServer, serverCapabilities });
 
   return stdioServer;
 };
