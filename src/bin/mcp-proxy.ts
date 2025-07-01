@@ -22,10 +22,9 @@ if (!("EventSource" in global)) {
 
 const argv = await yargs(hideBin(process.argv))
   .scriptName("mcp-proxy")
-  .command("$0 <command> [args...]", "Run a command with MCP arguments")
+  .command("$0 [command] [args...]", "Run MCP proxy with optional command")
   .positional("command", {
-    demandOption: true,
-    describe: "The command to run",
+    describe: "The command to run (optional for dynamic proxy mode)",
     type: "string",
   })
   .positional("args", {
@@ -69,21 +68,41 @@ const argv = await yargs(hideBin(process.argv))
       describe: "The stream endpoint to listen on",
       type: "string",
     },
+    enableProxy: {
+      default: true,
+      describe: "Enable HTTP proxy functionality",
+      type: "boolean",
+    },
+    dynamicProxy: {
+      default: false,
+      describe: "Enable dynamic MCP proxy mode (no fixed backend server)",
+      type: "boolean",
+    },
   })
   .help()
   .parseAsync();
 
 const connect = async (client: Client) => {
+  // 添加类型检查 - 只有在非动态代理模式下才需要command
+  if (!argv.dynamicProxy && !argv.command) {
+    throw new Error("Command is required when not using dynamic proxy mode");
+  }
+  
+  // 如果是动态代理模式，不需要连接到固定服务器
+  if (argv.dynamicProxy) {
+    return;
+  }
+  
   const transport = new StdioClientTransport({
     args: argv.args,
-    command: argv.command,
+    command: argv.command!, // 使用非空断言，因为我们已经检查过了
     env: process.env as Record<string, string>,
     onEvent: (event) => {
       if (argv.debug) {
         console.debug("transport event", event);
       }
     },
-    shell: argv.shell,
+    shell: argv.shell as boolean,
     stderr: "pipe",
   });
 
@@ -91,41 +110,57 @@ const connect = async (client: Client) => {
 };
 
 const proxy = async () => {
-  const client = new Client(
-    {
-      name: "mcp-proxy",
-      version: "1.0.0",
-    },
-    {
-      capabilities: {},
-    },
-  );
+  let client: Client | null = null;
+  let serverVersion: { name: string; version: string } | null = null;
+  let serverCapabilities: { capabilities: Record<string, unknown> } | null = null;
 
-  await connect(client);
+  // 只有在非动态代理模式下才创建固定的client连接
+  if (!argv.dynamicProxy) {
+    client = new Client(
+      {
+        name: "mcp-proxy",
+        version: "1.0.0",
+      },
+      {
+        capabilities: {},
+      },
+    );
 
-  const serverVersion = client.getServerVersion() as {
-    name: string;
-    version: string;
-  };
+    await connect(client);
 
-  const serverCapabilities = client.getServerCapabilities() as {
-    capabilities: Record<string, unknown>;
-  };
+    serverVersion = client.getServerVersion() as {
+      name: string;
+      version: string;
+    };
+
+    serverCapabilities = client.getServerCapabilities() as {
+      capabilities: Record<string, unknown>;
+    };
+  }
 
   console.info("starting server on port %d", argv.port);
 
   const createServer = async () => {
-    const server = new Server(serverVersion, {
-      capabilities: serverCapabilities,
-    });
+    if (!argv.dynamicProxy && client && serverVersion && serverCapabilities) {
+      // 固定代理模式
+      const server = new Server(serverVersion, {
+        capabilities: serverCapabilities,
+      });
 
-    proxyServer({
-      client,
-      server,
-      serverCapabilities,
-    });
+      proxyServer({
+        client,
+        server,
+        serverCapabilities,
+      });
 
-    return server;
+      return server;
+    } else {
+      // 动态代理模式 - 返回一个简单的服务器实例
+      return new Server(
+        { name: "mcp-proxy", version: "1.0.0" },
+        { capabilities: {} }
+      );
+    }
   };
 
   await startHTTPServer({
@@ -134,6 +169,7 @@ const proxy = async () => {
     port: argv.port,
     sseEndpoint: argv.server && argv.server !== "sse" ? null : (argv.sseEndpoint ?? argv.endpoint),
     streamEndpoint: argv.server && argv.server !== "stream" ? null : (argv.streamEndpoint ?? argv.endpoint),
+    enableProxy: argv.enableProxy, // 新增参数
   });
 };
 

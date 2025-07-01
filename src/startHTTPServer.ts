@@ -9,6 +9,7 @@ import http from "http";
 import { randomUUID } from "node:crypto";
 
 import { InMemoryEventStore } from "./InMemoryEventStore.js";
+import { handleStreamableHttpProxy } from "./streamableHttpProxyHandler.js";
 
 export type SSEServer = {
   close: () => Promise<void>;
@@ -375,6 +376,8 @@ const handleSSERequest = async <T extends ServerLike>({
   return false;
 };
 
+
+
 export const startHTTPServer = async <T extends ServerLike>({
   createServer,
   eventStore,
@@ -384,6 +387,7 @@ export const startHTTPServer = async <T extends ServerLike>({
   port,
   sseEndpoint,
   streamEndpoint,
+  enableProxy = true, // 新增选项，默认启用代理功能
 }: {
   createServer: (request: http.IncomingMessage) => Promise<T>;
   eventStore?: EventStore;
@@ -396,6 +400,7 @@ export const startHTTPServer = async <T extends ServerLike>({
   port: number;
   sseEndpoint?: null | string;
   streamEndpoint?: null | string;
+  enableProxy?: boolean; // 新增参数
 }): Promise<SSEServer> => {
   const activeSSETransports: Record<string, SSEServerTransport> = {};
 
@@ -434,6 +439,18 @@ export const startHTTPServer = async <T extends ServerLike>({
     if (req.method === "GET" && req.url === `/ping`) {
       res.writeHead(200).end("pong");
       return;
+    }
+    
+    // 在它之前添加：
+    // 新增：StreamableHTTP代理处理
+    // 正确的顺序
+    if (enableProxy) {
+      const url = new URL(req.url!, `http://${req.headers.host}`);
+      const targetUrl = url.searchParams.get('target');
+      if (targetUrl && await handleStreamableHttpProxy(req, res, targetUrl)) {  // StreamableHTTP代理先执行
+        console.log("StreamableHTTP代理处理成功")
+        return;
+      }
     }
 
     if (
